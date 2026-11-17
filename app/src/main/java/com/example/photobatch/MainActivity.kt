@@ -3,12 +3,12 @@ package com.example.photobatch
 import android.Manifest
 import android.app.Activity
 import android.app.DatePickerDialog
-import android.content.ContentValues
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.view.WindowManager
 import android.widget.*
@@ -30,9 +30,11 @@ class MainActivity : Activity() {
     private lateinit var btnStart: Button
     private lateinit var btnEnd: Button
     private lateinit var btnRun: Button
+    private lateinit var btnFolder: Button
     private lateinit var tvLog: TextView
     private var startMs = 0L
     private var endMs = 0L
+    private var outputTree: Uri? = null
 
     override fun onCreate(s: Bundle?) {
         super.onCreate(s)
@@ -49,25 +51,48 @@ class MainActivity : Activity() {
         }
 
         root.addView(label("① 规则：每批张数"))
-        etBatch = edit("batch", "8", true); root.addView(etBatch)
+        etBatch = edit("batchCount", "6", true); root.addView(etBatch)
         root.addView(label("起始批次号"))
         etStartBatch = edit("startBatch", "1", true); root.addView(etStartBatch)
         root.addView(label("文件夹命名（{batch}=批次号）"))
         etFolder = edit("folder", "Set{batch}", false); root.addView(etFolder)
-        root.addView(label("文件命名（{batch}批次号 {n}批内序号）"))
-        etFile = edit("file", "Set{batch}_{n}", false); root.addView(etFile)
+        root.addView(label("每批文件名（按拍摄时间顺序，逗号分隔，不含扩展名）"))
+        etFile = edit("fileNames", "a,b,c,d,e,f", false).apply {
+            hint = "例如：a,b,c,d,e,f"
+        }
+        root.addView(etFile)
 
         root.addView(label("② 选择拍摄日期范围"))
         btnStart = Button(this).apply { text = "开始日期"; setOnClickListener { pick(true) } }
         btnEnd = Button(this).apply { text = "结束日期"; setOnClickListener { pick(false) } }
         root.addView(btnStart); root.addView(btnEnd)
 
-        btnRun = Button(this).apply { text = "开始任务"; setOnClickListener { startTask() } }
+        outputTree = prefs.getString("outputTree", null)?.let(Uri::parse)
+        btnFolder = Button(this).apply {
+            text = if (outputTree == null) "选择压缩包保存位置" else "已选择保存位置 · 更改"
+            setOnClickListener { startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), 2) }
+        }
+        root.addView(btnFolder)
+
+        btnRun = Button(this).apply { text = "开始任务"; setOnClickListener { run() } }
         root.addView(btnRun)
         tvLog = TextView(this)
         root.addView(ScrollView(this).apply { addView(tvLog) },
             LinearLayout.LayoutParams(-1, 0, 1f))
         setContentView(root)
+    }
+
+    @Deprecated("Use activity result API")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 2 && resultCode == RESULT_OK) {
+            val uri = data?.data ?: return
+            val flags = data.flags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            contentResolver.takePersistableUriPermission(uri, flags)
+            outputTree = uri
+            prefs.edit().putString("outputTree", uri.toString()).apply()
+            btnFolder.text = "已选择保存位置 · 更改"
+        }
     }
 
     private fun askPermissions() {
@@ -94,22 +119,21 @@ class MainActivity : Activity() {
 
     private fun query(): List<Img> {
         val out = ArrayList<Img>()
-        val base = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-        val cols = arrayOf(
-            MediaStore.Images.Media._ID,
-            MediaStore.Images.Media.DISPLAY_NAME,
-            MediaStore.Images.Media.DATE_TAKEN
-        )
-        val sel = MediaStore.Images.Media.DATE_TAKEN + " BETWEEN ? AND ?"
-        val order = MediaStore.Images.Media.DATE_TAKEN + " ASC, " + MediaStore.Images.Media._ID + " ASC"
-        val c = contentResolver.query(base, cols, sel, arrayOf(startMs.toString(), endMs.toString()), order)
-        if (c != null) {
+        val M = MediaStore.Images.Media
+        contentResolver.query(
+            M.EXTERNAL_CONTENT_URI,
+            arrayOf(M._ID, M.DISPLAY_NAME, M.DATE_TAKEN),
+            "${M.DATE_TAKEN} BETWEEN ? AND ?",
+            arrayOf(startMs.toString(), endMs.toString()),
+            "${M.DATE_TAKEN} ASC, ${M._ID} ASC"
+        )?.use { c ->
             while (c.moveToNext()) {
                 val id = c.getLong(0)
-                val name = c.getString(1) ?: "x.jpg"
-                out.add(Img(android.content.ContentUris.withAppendedId(base, id), name, c.getLong(2)))
+                out += Img(
+                    android.content.ContentUris.withAppendedId(M.EXTERNAL_CONTENT_URI, id),
+                    c.getString(1) ?: "x.jpg", c.getLong(2)
+                )
             }
-            c.close()
         }
         return out
     }
@@ -121,15 +145,30 @@ class MainActivity : Activity() {
         contentResolver.openInputStream(u)
     }
 
-    private fun startTask() {
+    private fun run() {
         if (startMs == 0L || endMs == 0L || endMs < startMs) { log("请先选好日期范围"); return }
-        val n = etBatch.text.toString().toIntOrNull() ?: 0
-        if (n <= 0) { log("每批张数无效"); return }
+        if (outputTree == null) { log("请先选择压缩包保存位置"); return }
+        val n = etBatch.text.toString().toIntOrNull()?.takeIf { it > 0 } ?: run { log("每批张数无效"); return }
         val firstBatch = etStartBatch.text.toString().toIntOrNull() ?: 1
         val folderT = etFolder.text.toString()
         val fileT = etFile.text.toString()
-        prefs.edit().putString("batch", "$n").putString("startBatch", "$firstBatch")
-            .putString("folder", folderT).putString("file", fileT).apply()
+        val names = fileT.split(Regex("[,，]"))
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+        if (names.size < n) {
+            log("每批张数为 $n，请至少输入 $n 个文件名，并用逗号分隔")
+            return
+        }
+        if (names.take(n).any { it.contains('/') || it.contains('\\') || it == "." || it == ".." }) {
+            log("文件名不能包含斜线")
+            return
+        }
+        if (names.take(n).distinct().size != n) {
+            log("每批文件名不能重复")
+            return
+        }
+        prefs.edit().putString("batchCount", "$n").putString("startBatch", "$firstBatch")
+            .putString("folder", folderT).putString("fileNames", fileT).apply()
 
         btnRun.isEnabled = false
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -137,22 +176,21 @@ class MainActivity : Activity() {
             try {
                 val imgs = query()
                 log("共 ${imgs.size} 张，每批 $n 张")
-                val w = maxOf(2, n.toString().length)
                 imgs.chunked(n).forEachIndexed { bi, chunk ->
                     val b = "%03d".format(firstBatch + bi)
                     val folder = folderT.replace("{batch}", b)
-                    val v = ContentValues().apply {
-                        put(MediaStore.Downloads.DISPLAY_NAME, "$folder.zip")
-                        put(MediaStore.Downloads.MIME_TYPE, "application/zip")
-                        put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/PhotoBatch")
-                    }
-                    val out = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v)!!
+                    val tree = outputTree ?: error("未选择保存位置")
+                    val parent = DocumentsContract.buildDocumentUriUsingTree(
+                        tree, DocumentsContract.getTreeDocumentId(tree)
+                    )
+                    val out = DocumentsContract.createDocument(
+                        contentResolver, parent, "application/zip", "$folder.zip"
+                    ) ?: error("无法在所选位置创建压缩包")
                     ZipOutputStream(BufferedOutputStream(contentResolver.openOutputStream(out)!!)).use { zos ->
                         zos.setLevel(Deflater.BEST_SPEED)
                         chunk.forEachIndexed { i, img ->
                             val ext = img.name.substringAfterLast('.', "jpg")
-                            val name = fileT.replace("{batch}", b)
-                                .replace("{n}", (i + 1).toString().padStart(w, '0'))
+                            val name = names[i]
                             val e = ZipEntry("$folder/$name.$ext")
                             if (img.taken > 0) e.time = img.taken
                             zos.putNextEntry(e)
@@ -162,7 +200,7 @@ class MainActivity : Activity() {
                     }
                     log("✔ $folder.zip（${chunk.size} 张）")
                 }
-                log("全部完成 → 下载/PhotoBatch/")
+                log("全部完成 → 所选文件夹")
             } catch (e: Exception) {
                 log("出错：${e.message}")
             } finally {
