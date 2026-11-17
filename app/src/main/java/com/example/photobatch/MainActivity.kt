@@ -13,8 +13,19 @@ import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.view.WindowManager
 import android.widget.*
+import com.google.android.gms.tasks.Tasks
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.label.ImageLabeler
+import com.google.mlkit.vision.label.ImageLabeling
+import com.google.mlkit.vision.label.defaults.ImageLabelerOptions
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.TextRecognizer
+import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.io.BufferedOutputStream
 import java.util.Calendar
+import java.util.Locale
+import java.util.concurrent.TimeUnit
 import java.util.zip.Deflater
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
@@ -84,6 +95,12 @@ class MainActivity : Activity() {
         root.addView(btnStart)
         root.addView(btnEnd)
 
+        root.addView(label("③ 智能分类标签（离线识别每批第一张）"))
+        root.addView(TextView(this).apply {
+            text = "People · PeopleGroup · Animal · Vehicle · DailyObject · Text · Plant · DetailObject · Distant"
+            setPadding(0, 12, 0, 0)
+        })
+
         outputTree = prefs.getString("outputTree", null)?.let(Uri::parse)
         btnFolder = Button(this).apply {
             text = if (outputTree == null) {
@@ -152,7 +169,9 @@ class MainActivity : Activity() {
             { _, y, m, d ->
                 val cal = Calendar.getInstance().apply {
                     set(
-                        y, m, d,
+                        y,
+                        m,
+                        d,
                         if (isStart) 0 else 23,
                         if (isStart) 0 else 59,
                         if (isStart) 0 else 59
@@ -205,11 +224,127 @@ class MainActivity : Activity() {
         return out
     }
 
-    // 读取原始文件字节，不重新编码，保留照片 EXIF 信息。
+    // 原始字节复制，不重新编码，保留照片 EXIF 信息。
     private fun openOriginal(u: Uri) = try {
         contentResolver.openInputStream(MediaStore.setRequireOriginal(u))
     } catch (e: Exception) {
         contentResolver.openInputStream(u)
+    }
+
+    private fun classifyTheme(
+        uri: Uri,
+        labeler: ImageLabeler,
+        latinRecognizer: TextRecognizer,
+        chineseRecognizer: TextRecognizer
+    ): String {
+        return try {
+            val image = InputImage.fromFilePath(this, uri)
+            val labels = Tasks.await(labeler.process(image), 30, TimeUnit.SECONDS)
+
+            val categories = linkedMapOf(
+                "PeopleGroup" to setOf(
+                    "crowd", "people", "group of people", "people group",
+                    "team", "audience", "gathering"
+                ),
+                "People" to setOf(
+                    "person", "human", "man", "woman", "child",
+                    "boy", "girl", "face", "portrait"
+                ),
+                "Animal" to setOf(
+                    "animal", "dog", "cat", "bird", "fish", "horse",
+                    "insect", "reptile", "mammal", "wildlife"
+                ),
+                "Vehicle" to setOf(
+                    "vehicle", "car", "automobile", "truck", "bus", "van",
+                    "motorcycle", "bicycle", "scooter", "train", "aircraft",
+                    "airplane", "boat", "ship", "tractor"
+                ),
+                "Text" to setOf(
+                    "text", "sign", "book", "newspaper", "letter",
+                    "document", "poster", "label", "menu",
+                    "handwriting", "typography"
+                ),
+                "Plant" to setOf(
+                    "plant", "flower", "tree", "leaf", "grass", "foliage",
+                    "forest", "shrub", "mushroom"
+                ),
+                "DetailObject" to setOf(
+                    "macro", "close-up", "closeup", "texture", "reflection",
+                    "transparent", "glass", "mirror", "detail", "water droplet"
+                ),
+                "Distant" to setOf(
+                    "landscape", "mountain", "horizon", "seascape",
+                    "skyline", "valley", "panorama", "countryside", "scenery"
+                )
+            )
+
+            fun scoreFor(words: Set<String>): Float = labels
+                .filter { label ->
+                    val text = label.text.lowercase(Locale.ROOT)
+                        .replace(Regex("[^a-z0-9]+"), " ")
+                        .trim()
+                    words.any { word ->
+                        val normalizedWord = word.lowercase(Locale.ROOT)
+                            .replace(Regex("[^a-z0-9]+"), " ")
+                            .trim()
+                        " $text ".contains(" $normalizedWord ")
+                    }
+                }
+                .maxOfOrNull { it.confidence } ?: 0f
+
+            val scores = categories.map { (category, words) ->
+                category to scoreFor(words)
+            }
+            val textScore = scores.first { it.first == "Text" }.second
+            val bestSubject = scores
+                .filter { it.first != "Text" }
+                .maxByOrNull { it.second }
+            val subjectScore = bestSubject?.second ?: 0f
+            val hasText = imageHasText(uri, latinRecognizer, chineseRecognizer)
+
+            when {
+                bestSubject != null &&
+                    bestSubject.first in setOf("PeopleGroup", "People", "Animal", "Vehicle") &&
+                    subjectScore >= 0.35f -> bestSubject.first
+
+                hasText && subjectScore < 0.60f -> "Text"
+                textScore >= 0.35f && textScore >= subjectScore -> "Text"
+                bestSubject != null && subjectScore >= 0.35f -> bestSubject.first
+                hasText -> "Text"
+                else -> "DailyObject"
+            }
+        } catch (e: Exception) {
+            log("分类失败，使用默认标签 DailyObject：${e.message ?: "未知错误"}")
+            "DailyObject"
+        }
+    }
+
+    private fun imageHasText(
+        uri: Uri,
+        latinRecognizer: TextRecognizer,
+        chineseRecognizer: TextRecognizer
+    ): Boolean {
+        return try {
+            val image = InputImage.fromFilePath(this, uri)
+            val latin = Tasks.await(
+                latinRecognizer.process(image),
+                30,
+                TimeUnit.SECONDS
+            ).text
+            if (latin.count { it.isLetterOrDigit() } >= 2) {
+                true
+            } else {
+                val chinese = Tasks.await(
+                    chineseRecognizer.process(image),
+                    30,
+                    TimeUnit.SECONDS
+                ).text
+                chinese.count { it.isLetterOrDigit() } >= 2
+            }
+        } catch (e: Exception) {
+            log("文字识别失败：${e.message ?: "未知错误"}")
+            false
+        }
     }
 
     private fun run() {
@@ -261,13 +396,42 @@ class MainActivity : Activity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         Thread {
+            var labeler: ImageLabeler? = null
+            var latinRecognizer: TextRecognizer? = null
+            var chineseRecognizer: TextRecognizer? = null
+
             try {
+                val activeLabeler = ImageLabeling.getClient(
+                    ImageLabelerOptions.Builder()
+                        .setConfidenceThreshold(0.35f)
+                        .build()
+                )
+                labeler = activeLabeler
+
+                val activeLatinRecognizer =
+                    TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+                latinRecognizer = activeLatinRecognizer
+
+                val activeChineseRecognizer = TextRecognition.getClient(
+                    ChineseTextRecognizerOptions.Builder().build()
+                )
+                chineseRecognizer = activeChineseRecognizer
+
                 val imgs = query()
                 log("共 ${imgs.size} 张，每批 $n 张")
 
                 imgs.chunked(n).forEachIndexed { bi, chunk ->
                     val b = "%03d".format(firstBatch + bi)
-                    val folder = folderT.replace("{batch}", b)
+                    val baseFolder = folderT.replace("{batch}", b)
+                    val theme = classifyTheme(
+                        chunk.first().uri,
+                        activeLabeler,
+                        activeLatinRecognizer,
+                        activeChineseRecognizer
+                    )
+                    val folder = "${baseFolder}_$theme"
+                    log("$baseFolder 分类：$theme")
+
                     val tree = outputTree ?: error("未选择保存位置")
                     val parent = DocumentsContract.buildDocumentUriUsingTree(
                         tree,
@@ -284,6 +448,7 @@ class MainActivity : Activity() {
                         BufferedOutputStream(contentResolver.openOutputStream(out)!!)
                     ).use { zos ->
                         zos.setLevel(Deflater.BEST_SPEED)
+
                         chunk.forEachIndexed { i, img ->
                             val ext = img.name.substringAfterLast('.', "jpg")
                             val name = names[i]
@@ -301,6 +466,9 @@ class MainActivity : Activity() {
             } catch (e: Exception) {
                 log("出错：${e.message}")
             } finally {
+                labeler?.close()
+                latinRecognizer?.close()
+                chineseRecognizer?.close()
                 runOnUiThread {
                     btnRun.isEnabled = true
                     window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
