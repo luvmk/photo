@@ -62,7 +62,7 @@ class MainActivity : Activity() {
         btnEnd = Button(this).apply { text = "结束日期"; setOnClickListener { pick(false) } }
         root.addView(btnStart); root.addView(btnEnd)
 
-        btnRun = Button(this).apply { text = "开始任务"; setOnClickListener { run() } }
+        btnRun = Button(this).apply { text = "开始任务"; setOnClickListener { startTask() } }
         root.addView(btnRun)
         tvLog = TextView(this)
         root.addView(ScrollView(this).apply { addView(tvLog) },
@@ -94,21 +94,22 @@ class MainActivity : Activity() {
 
     private fun query(): List<Img> {
         val out = ArrayList<Img>()
-        val M = MediaStore.Images.Media
-        contentResolver.query(
-            M.EXTERNAL_CONTENT_URI,
-            arrayOf(M._ID, M.DISPLAY_NAME, M.DATE_TAKEN),
-            "${M.DATE_TAKEN} BETWEEN ? AND ?",
-            arrayOf(startMs.toString(), endMs.toString()),
-            "${M.DATE_TAKEN} ASC, ${M._ID} ASC"
-        )?.use { c ->
+        val base = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        val cols = arrayOf(
+            MediaStore.Images.Media._ID,
+            MediaStore.Images.Media.DISPLAY_NAME,
+            MediaStore.Images.Media.DATE_TAKEN
+        )
+        val sel = MediaStore.Images.Media.DATE_TAKEN + " BETWEEN ? AND ?"
+        val order = MediaStore.Images.Media.DATE_TAKEN + " ASC, " + MediaStore.Images.Media._ID + " ASC"
+        val c = contentResolver.query(base, cols, sel, arrayOf(startMs.toString(), endMs.toString()), order)
+        if (c != null) {
             while (c.moveToNext()) {
                 val id = c.getLong(0)
-                out += Img(
-                    android.content.ContentUris.withAppendedId(M.EXTERNAL_CONTENT_URI, id),
-                    c.getString(1) ?: "x.jpg", c.getLong(2)
-                )
+                val name = c.getString(1) ?: "x.jpg"
+                out.add(Img(android.content.ContentUris.withAppendedId(base, id), name, c.getLong(2)))
             }
+            c.close()
         }
         return out
     }
@@ -120,9 +121,10 @@ class MainActivity : Activity() {
         contentResolver.openInputStream(u)
     }
 
-    private fun run() {
+    private fun startTask() {
         if (startMs == 0L || endMs == 0L || endMs < startMs) { log("请先选好日期范围"); return }
-        val n = etBatch.text.toString().toIntOrNull()?.takeIf { it > 0 } ?: run { log("每批张数无效"); return }
+        val n = etBatch.text.toString().toIntOrNull() ?: 0
+        if (n <= 0) { log("每批张数无效"); return }
         val firstBatch = etStartBatch.text.toString().toIntOrNull() ?: 1
         val folderT = etFolder.text.toString()
         val fileT = etFile.text.toString()
